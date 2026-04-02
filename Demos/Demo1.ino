@@ -165,35 +165,68 @@ void setup() {
 
 void loop() {
   unsigned long now = millis();
+  updateButton(now);
 
-  // -------------------- Color sensor: robust revolution counting --------------------
-  if (now - lastSampleMs >= sampleMs) {
-    lastSampleMs = now;
-
-    uint16_t r, g, b, c;
-    tcs.getRawData(&r, &g, &b, &c);
-
-    bool red = isRedMark(r, g, b);
-
-    if (red) {
-      nonRedStreak = 0;
-
-      // Count only once per pass (must be armed)
-      if (revArmed && (now - lastCountMs >= lockoutMs)) {
-        lastCountMs = now;
-        count++;
-        onRevolution();
-        revArmed = false; // disarm until we clearly leave red
-      }
-    } else {
-      // Build up proof we left the mark
-      if (nonRedStreak < 1000) nonRedStreak++;
-
-      if (nonRedStreak >= NONRED_TO_REARM) {
-        revArmed = true;
-      }
+  // 1. IMU tracking
+  if (state != WAIT_BITE) {
+    BNO08x_RVC_Data data;
+    if (rvc.read(&data)) {
+      float amag = sqrtf(data.x_accel * data.x_accel + data.y_accel * data.y_accel + data.z_accel * data.z_accel);
+      if (amagLP == 0.0f) amagLP = amag;
+      amagLP = LP_ALPHA * amagLP + (1.0f - LP_ALPHA) * amag;
+      imuDynAccel = fabsf(amag - amagLP);
+      forceNewtons = MASS_KG * imuDynAccel;
+      forceUpdated = true;
     }
   }
+
+  updateStateMachine(now);
+
+  // 2. Piezo / Bite detection
+  int v = analogRead(PIEZO_PIN);
+  piezoBaseline = (int)((1.0f - piezoAlpha) * piezoBaseline + piezoAlpha * v);
+  piezoSpike = abs(v - piezoBaseline);
+
+  if (state == WAIT_BITE && now >= biteEnableAtMs && now >= biteLockoutUntil) {
+    if (piezoSpike > BITE_THRESH[sensIdx]) {
+      biteBannerUntil = now + BITE_BANNER_MS;
+      biteLockoutUntil = now + BITE_LOCKOUT_MS;
+      playBiteAlert();
+      if (AUTO_REARM_AFTER_BITE) enterArmed(millis());
+    }
+  }
+
+  // 3. Force Hold Logic
+  if (forceUpdated) {
+    if (state == CASTING && forceNewtons > forceHold) {
+      forceHold = forceNewtons;
+      holdUntilMs = now + HOLD_MS;
+    }
+    forceUpdated = false;
+  }
+  if (now >= holdUntilMs) {
+    forceHold *= HOLD_DECAY_PER_UPDATE;
+    if (forceHold < HOLD_FLOOR) forceHold = 0.0f;
+  }
+
+  // 4. Distance Calculation
+  int localPulses; 
+  noInterrupts(); 
+  localPulses = pulseCount; 
+  interrupts();
+  float dist_ft = (localPulses * PULSES_TO_REVOLUTIONS * CIRCUMFERENCE * CALIBRATION_FACTOR) * METERS_TO_FEET;
+
+  // 5. Bluetooth Data Package
+  if (now - lastBtTxMs >= BT_TX_INTERVAL) {
+    lastBtTxMs = now;
+    if (SerialBT.hasClient()) {
+      // Create a single CSV string for the app: Distance, Force, State
+      String packet = String(dist_ft, 1) + "," + String(forceHold, 2) + "," + stateLabel(state, (now < biteBannerUntil));
+      SerialBT.println(packet); 
+      Serial.println("[BT SENDING]: " + packet);
+    }
+  }
+}
 
   // -------------------- IMU: Drain UART packets and compute force --------------------
   {
