@@ -10,7 +10,9 @@
 // ==================== Bluetooth Configuration ====================
 BluetoothSerial SerialBT; 
 unsigned long lastBtTxMs = 0;
-const unsigned long BT_TX_INTERVAL = 200; // Updated to 5Hz for smoother app updates
+// Set to 50ms (20Hz). This is fast enough for real-time bite detection 
+// and matches the App Inventor clock to prevent buffer lag.
+const unsigned long BT_TX_INTERVAL = 50; 
 
 // ==================== State Machine ====================
 enum RodState : uint8_t { ARMED = 0, CASTING = 1, WAIT_BITE = 2 };
@@ -53,6 +55,9 @@ const float METERS_TO_FEET     = 3.28084f;
 
 volatile int pulseCount = 0;
 volatile unsigned long lastTriggerTime = 0;
+
+// THIS IS THE NEW VARIABLE TO LOCK YOUR DISTANCE
+float savedCastDistance = 0.0f; 
 
 // -------------------- IMU Power Meter --------------------
 const float MASS_KG = 0.05f;
@@ -165,6 +170,12 @@ static void enterCasting(unsigned long now) {
   state = CASTING; forceNewtons = 0.0f; forceHold = 0.0f;
   forceUpdated = false; holdUntilMs = 0;
   biteEnableAtMs = now + 9999999UL;
+
+  // RESET SPOOL COUNTER EXACTLY WHEN CAST STARTS
+  noInterrupts(); 
+  pulseCount = 0; 
+  interrupts();
+  savedCastDistance = 0.0f; // Reset display to 0 for the new cast
 }
 
 static void enterWaitBite(unsigned long now) {
@@ -289,12 +300,16 @@ void loop() {
   // Distance calculation
   int localPulses; noInterrupts(); localPulses = pulseCount; interrupts();
   float dist_m = localPulses * PULSES_TO_REVOLUTIONS * CIRCUMFERENCE * CALIBRATION_FACTOR;
-  float dist_ft = dist_m * METERS_TO_FEET;
+  
+  // LOCK THE DISTANCE: Only update the saved number while actively casting
+  if (state == CASTING) {
+    savedCastDistance = dist_m;
+  }
 
-  // LCD Update
+  // LCD Update (Using the locked distance so the screen matches the app)
   if (now - lastLcdMs >= lcdMs) {
     lastLcdMs = now;
-    drawNokiaUI(dist_m, dist_ft, forceHold, state, (now < biteBannerUntil), sensIdx);
+    drawNokiaUI(savedCastDistance, savedCastDistance * METERS_TO_FEET, forceHold, state, (now < biteBannerUntil), sensIdx);
   }
 
   // ==================== APP DATA TRANSMISSION ====================
@@ -302,13 +317,23 @@ void loop() {
     lastBtTxMs = now;
 
     if (SerialBT.hasClient()) {
-      // Create the data package: Distance,Force,State
-      // This matches the "Split" logic in your App Inventor blocks
-      String packet = String(dist_ft, 1) + "," + 
-                      String(forceHold, 2) + "," + 
-                      stateLabel(state, (now < biteBannerUntil));
+      
+      // 1. The dynamic Bite String: Shows "FISH" when the piezo triggers, otherwise "No"
+      String biteStatus = (now < biteBannerUntil) ? "FISH" : "No";
 
-      SerialBT.println(packet); // Send with newline \n
+      // 2. The cleanly formatted 5-part data package
+      // Index 1: Force in Newtons 
+      // Index 2: Bite Status (FISH / No)
+      // Index 3: Rod State (ARM / CAST / WAIT)
+      // Index 4: Sensitivity (HIGH / MED / LOW)
+      // Index 5: LOCKED Distance in Meters
+      String packet = String(forceHold, 2) + "," + 
+                      biteStatus + "," + 
+                      stateLabel(state, (now < biteBannerUntil)) + "," +
+                      sensLabel(sensIdx) + "," +
+                      String(savedCastDistance, 1);
+
+      SerialBT.println(packet); 
       
       // Feedback for debugging in Serial Monitor
       Serial.print("[BT SENDING]: ");
