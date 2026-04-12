@@ -7,6 +7,13 @@
 #include <SPI.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_PCD8544.h>
+#include "BluetoothSerial.h" // Added for App Integration
+
+// ==================== Bluetooth Configuration ====================
+BluetoothSerial SerialBT; 
+unsigned long lastBtTxMs = 0;
+// Set to 50ms (20Hz) for real-time bite detection
+const unsigned long BT_TX_INTERVAL = 50; 
 
 // ==================== State Machine ====================
 // ARMED    : IMU active, waiting for cast onset
@@ -65,6 +72,9 @@ const float METERS_TO_FEET     = 3.28084f;
 
 volatile int pulseCount = 0;
 volatile unsigned long lastTriggerTime = 0;
+
+// ADDED: Memory variable to lock the distance after a cast
+float savedCastDistance = 0.0f; 
 
 // -------------------- IMU Power Meter --------------------
 
@@ -231,6 +241,12 @@ static void enterCasting(unsigned long now) {
   holdUntilMs = 0;
 
   biteEnableAtMs = now + 9999999UL;
+
+  // ADDED: Reset spool counter and display distance when cast starts
+  noInterrupts();
+  pulseCount = 0;
+  interrupts();
+  savedCastDistance = 0.0f; 
 }
 
 static void enterWaitBite(unsigned long now) {
@@ -353,6 +369,7 @@ static void resetModel() {
 
 void setup() {
   Serial.begin(115200);
+  SerialBT.begin("CyberFish_Rod"); // ADDED: Start Bluetooth Server
 
   pinMode(HALL_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(HALL_PIN), hall_ISR, FALLING);
@@ -480,13 +497,53 @@ void loop() {
 
   float revolutions = localPulseCount * PULSES_TO_REVOLUTIONS;
   float distance_m  = revolutions * CIRCUMFERENCE * CALIBRATION_FACTOR;
-  float distance_ft = distance_m * METERS_TO_FEET;
+
+    savedCastDistance = distance_m;
+  
+  float distance_ft = savedCastDistance * METERS_TO_FEET;
 
   // -------------------- Display --------------------
   if (now - lastLcdMs >= lcdMs) {
     lastLcdMs = now;
     bool biteBanner = (now < biteBannerUntil);
-    drawNokiaUI(distance_m, distance_ft, forceHold, state, biteBanner, sensIdx);
+    // Updated to show the locked distance on the physical screen too
+    drawNokiaUI(savedCastDistance, distance_ft, forceHold, state, biteBanner, sensIdx);
+  }
+
+  // ==================== APP DATA TRANSMISSION ====================
+  if (now - lastBtTxMs >= BT_TX_INTERVAL) {
+    lastBtTxMs = now;
+
+    if (SerialBT.hasClient()) {
+      
+      // 1. Dynamic Bite String
+      String biteStatus = (now < biteBannerUntil) ? "FISH" : "No";
+
+      // 2. The 5-part Data Package
+      // Index 1: Force in Newtons 
+      // Index 2: Bite Status (FISH / No)
+      // Index 3: Rod State (ARM / CAST / WAIT)
+      // Index 4: Sensitivity (HIGH / MED / LOW)
+      // Index 5: LOCKED Distance in Meters
+      String packet = String(forceHold, 2) + "," + 
+                      biteStatus + "," + 
+                      stateLabel(state, (now < biteBannerUntil)) + "," +
+                      sensLabel(sensIdx) + "," +
+                      String(savedCastDistance, 1);
+
+      SerialBT.println(packet); 
+      
+      // Debugging
+      Serial.print("[BT SENDING]: ");
+      Serial.println(packet);
+    } 
+    else {
+      static unsigned long lastWait = 0;
+      if (now - lastWait > 5000) {
+        Serial.println("[BT STATUS]: Waiting for CyberFish app...");
+        lastWait = now;
+      }
+    }
   }
 
   // -------------------- Serial Commands --------------------
