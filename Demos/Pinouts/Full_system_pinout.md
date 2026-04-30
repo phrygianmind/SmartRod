@@ -1,6 +1,6 @@
-# Smart Rod v3 (Demo 3) — Full Pinout (ESP32 DevKit V1)
+# Smart Rod v4 (Final Demo) — Full Pinout (ESP32 DevKit V1)
 
-Demo 3 changes vs v2:
+Full System changes vs V2:
 
 * MPU6050 replaces the BNO085 for IMU cast-detection / power-bar logic
 * Nokia 5110 (PCD8544) still used for display
