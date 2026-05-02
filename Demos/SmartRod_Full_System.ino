@@ -20,8 +20,9 @@ const unsigned long BT_TX_INTERVAL = 50;
 // ==================== State Machine ====================
 // ARMED    : IMU active, waiting for cast onset
 // CASTING  : IMU active, peak cast force tracked for power bar
-// WAIT_BITE: IMU active, piezo monitored for bite detection
-enum RodState : uint8_t { ARMED = 0, CASTING = 1, WAIT_BITE = 2 };
+// WAIT_BITE: Piezo monitored for bite detection after cast settles
+// REELING  : Hall sensor active, distance measured while reeling in
+enum RodState : uint8_t { ARMED = 0, CASTING = 1, WAIT_BITE = 2, REELING = 3 };
 RodState state = ARMED;
 
 // -------------------- Hardware Pins --------------------
@@ -83,6 +84,7 @@ const float CALIBRATION_FACTOR = 1.00f;
 
 volatile int pulseCount = 0;
 volatile unsigned long lastTriggerTime = 0;
+volatile bool hallPulseFlag = false;
 
 float savedCastDistance = 0.0f;
 
@@ -111,7 +113,9 @@ float imuDynAccel = 0.0f;
 int piezoBaseline = 0;
 float piezoAlpha = 0.02f;
 int piezoSpike = 0;
-static const bool AUTO_REARM_AFTER_BITE = true;
+
+// Retained for developer convenience, but bite now transitions into REELING.
+static const bool AUTO_REARM_AFTER_BITE = false;
 
 // HIGH, MED, LOW sensitivity thresholds
 int BITE_THRESH[3] = { 500, 1500, 3000 };
@@ -154,6 +158,7 @@ static const char* stateLabel(RodState st, bool biteBanner) {
     case ARMED:     return "ARM";
     case CASTING:   return "CAST";
     case WAIT_BITE: return "WAIT";
+    case REELING:   return "REEL";
     default:        return "?";
   }
 }
@@ -168,12 +173,13 @@ static const char* sensLabel(uint8_t idx) {
 }
 
 // Hall pulse ISR with debounce.
+// Pulse acceptance is deferred to loop() so counting can be state-gated safely.
 void IRAM_ATTR hall_ISR() {
   unsigned long currentTime = millis();
 
   if (currentTime - lastTriggerTime > 200) {
-    pulseCount++;
     lastTriggerTime = currentTime;
+    hallPulseFlag = true;
   }
 }
 
@@ -255,6 +261,12 @@ static void enterArmed(unsigned long now) {
   biteLockoutUntil = 0;
 
   biteEnableAtMs = now + 300;
+
+  //noInterrupts();
+  //pulseCount = 0;
+  //interrupts();
+
+  //savedCastDistance = 0.0f;
 }
 
 static void enterCasting(unsigned long now) {
@@ -282,6 +294,26 @@ static void enterWaitBite(unsigned long now) {
   castQuietStartMs = 0;
 
   biteEnableAtMs = now + POST_CAST_SETTLE_MS;
+}
+
+static void enterReeling(unsigned long now) {
+  state = REELING;
+  castCandidateStartMs = 0;
+  castQuietStartMs = 0;
+
+  noInterrupts();
+  pulseCount = 0;
+  interrupts();
+
+  savedCastDistance = 0.0f;
+
+  // Power-bar logic is only meaningful for casting.
+  forceNewtons = 0.0f;
+  forceHold = 0.0f;
+  forceUpdated = false;
+  holdUntilMs = 0;
+
+  biteLockoutUntil = now + BITE_LOCKOUT_MS;
 }
 
 // ==================== State Machine Update ====================
@@ -313,7 +345,13 @@ static void updateStateMachine(unsigned long now) {
     return;
   }
 
-  // WAIT_BITE persists until explicit re-arm/reset or auto re-arm.
+  if (state == WAIT_BITE) {
+    return;
+  }
+
+  if (state == REELING) {
+    return;
+  }
 }
 
 // -------------------- Nokia UI --------------------
@@ -375,6 +413,7 @@ static void resetModel() {
   noInterrupts();
   pulseCount = 0;
   lastTriggerTime = 0;
+  hallPulseFlag = false;
   interrupts();
 
   forceNewtons = 0.0f;
@@ -400,6 +439,61 @@ static void resetModel() {
   display.setCursor(0, 0);
   display.print("Reset");
   display.display();
+}
+
+// -------------------- Command Handling --------------------
+
+static void finalizeReelingAndRearm() {
+  Serial.print("Final distance (m): ");
+  Serial.println(savedCastDistance, 2);
+
+  if (SerialBT.hasClient()) {
+    SerialBT.print("FINAL,");
+    SerialBT.println(savedCastDistance, 1);
+  }
+
+  enterArmed(millis());
+}
+
+static void handleCommand(char ch) {
+  if (ch == 'r' || ch == 'R') {
+    resetModel();
+    Serial.println("Reset.");
+  } else if (ch == 'a' || ch == 'A') {
+    enterArmed(millis());
+    Serial.println("Re-armed.");
+  } else if (ch == '1') {
+    sensIdx = 0;
+    Serial.println("Piezo sensitivity: HIGH");
+  } else if (ch == '2') {
+    sensIdx = 1;
+    Serial.println("Piezo sensitivity: MED");
+  } else if (ch == '3') {
+    sensIdx = 2;
+    Serial.println("Piezo sensitivity: LOW");
+  } else if (ch == 'x' || ch == 'X' || ch == 'd' || ch == 'D') {
+    if (state == REELING) {
+      finalizeReelingAndRearm();
+      Serial.println("Reeling done. Final distance stored/sent.");
+    } else {
+      Serial.println("DONE ignored: not currently reeling.");
+    }
+  } else if (ch == '?') {
+    Serial.print("dyn=");
+    Serial.print(imuDynAccel, 3);
+    Serial.print(" force=");
+    Serial.print(forceNewtons, 3);
+    Serial.print(" hold=");
+    Serial.print(forceHold, 3);
+    Serial.print(" state=");
+    Serial.print(stateLabel(state, millis() < biteBannerUntil));
+    Serial.print(" tempC=");
+    if (waterTempC == DEVICE_DISCONNECTED_C) {
+      Serial.println("NA");
+    } else {
+      Serial.println(waterTempC, 2);
+    }
+  }
 }
 
 void setup() {
@@ -468,6 +562,17 @@ void loop() {
   // -------------------- Water Temperature --------------------
   updateWaterTemperature(now);
 
+  // -------------------- Hall Pulse Consume --------------------
+  if (hallPulseFlag) {
+    noInterrupts();
+    hallPulseFlag = false;
+    interrupts();
+
+    if (state == REELING) {
+      pulseCount++;
+    }
+  }
+
   // -------------------- IMU Read --------------------
   sensors_event_t a, g, temp;
   mpu.getEvent(&a, &g, &temp);
@@ -514,6 +619,11 @@ void loop() {
           enterArmed(millis());
           biteBannerUntil = bannerUntil;
           biteLockoutUntil = lockoutUntil;
+        } else {
+          enterReeling(millis());
+          biteBannerUntil = bannerUntil;
+          biteLockoutUntil = lockoutUntil;
+          Serial.println("Auto-transition: WAIT_BITE -> REELING");
         }
       }
     }
@@ -536,15 +646,18 @@ void loop() {
   }
 
   // -------------------- Distance --------------------
-  int localPulseCount;
-  noInterrupts();
-  localPulseCount = pulseCount;
-  interrupts();
+  float distance_m = savedCastDistance;
 
-  float revolutions = localPulseCount * PULSES_TO_REVOLUTIONS;
-  float distance_m  = revolutions * CIRCUMFERENCE * CALIBRATION_FACTOR;
+  if (state == REELING) {
+    int localPulseCount;
+    noInterrupts();
+    localPulseCount = pulseCount;
+    interrupts();
 
-  savedCastDistance = distance_m;
+    float revolutions = localPulseCount * PULSES_TO_REVOLUTIONS;
+    distance_m = revolutions * CIRCUMFERENCE * CALIBRATION_FACTOR;
+    savedCastDistance = distance_m;
+  }
 
   // -------------------- Display --------------------
   if (now - lastLcdMs >= lcdMs) {
@@ -584,37 +697,12 @@ void loop() {
   // -------------------- Serial Commands --------------------
   if (Serial.available()) {
     char ch = (char)Serial.read();
+    handleCommand(ch);
+  }
 
-    if (ch == 'r' || ch == 'R') {
-      resetModel();
-      Serial.println("Reset.");
-    } else if (ch == 'a' || ch == 'A') {
-      enterArmed(millis());
-      Serial.println("Re-armed.");
-    } else if (ch == '1') {
-      sensIdx = 0;
-      Serial.println("Piezo sensitivity: HIGH");
-    } else if (ch == '2') {
-      sensIdx = 1;
-      Serial.println("Piezo sensitivity: MED");
-    } else if (ch == '3') {
-      sensIdx = 2;
-      Serial.println("Piezo sensitivity: LOW");
-    } else if (ch == 'd' || ch == 'D') {
-      Serial.print("dyn=");
-      Serial.print(imuDynAccel, 3);
-      Serial.print(" force=");
-      Serial.print(forceNewtons, 3);
-      Serial.print(" hold=");
-      Serial.print(forceHold, 3);
-      Serial.print(" state=");
-      Serial.print(stateLabel(state, now < biteBannerUntil));
-      Serial.print(" tempC=");
-      if (waterTempC == DEVICE_DISCONNECTED_C) {
-        Serial.println("NA");
-      } else {
-        Serial.println(waterTempC, 2);
-      }
-    }
+  // -------------------- Bluetooth Commands --------------------
+  if (SerialBT.available()) {
+    char ch = (char)SerialBT.read();
+    handleCommand(ch);
   }
 }
