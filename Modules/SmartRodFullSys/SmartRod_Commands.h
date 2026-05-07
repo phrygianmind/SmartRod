@@ -50,43 +50,36 @@ static void finalizeReelingAndRearm() {
   enterArmed(millis());
 }
 
-static void handleCommand(char ch) {
+void handleCommand(char ch) {
   if (ch == 'r' || ch == 'R') {
     resetModel();
     Serial.println("Reset.");
-  } else if (ch == 'a' || ch == 'A') {
+  }
+  else if (ch == 'a' || ch == 'A') {
     enterArmed(millis());
     Serial.println("Re-armed.");
-  } else if (ch == '1') {
+  }
+  else if (ch == '1') {
     sensIdx = 0;
     Serial.println("Piezo sensitivity: HIGH");
-  } else if (ch == '2') {
+    if (SerialBT.hasClient()) SerialBT.println("SENS,HIGH");
+  }
+  else if (ch == '2') {
     sensIdx = 1;
     Serial.println("Piezo sensitivity: MED");
-  } else if (ch == '3') {
+    if (SerialBT.hasClient()) SerialBT.println("SENS,MED");
+  }
+  else if (ch == '3') {
     sensIdx = 2;
     Serial.println("Piezo sensitivity: LOW");
-  } else if (ch == 'x' || ch == 'X' || ch == 'd' || ch == 'D') {
+    if (SerialBT.hasClient()) SerialBT.println("SENS,LOW");
+  }
+  else if (ch == 'd' || ch == 'D' || ch == 'x' || ch == 'X') {
     if (state == REELING) {
       finalizeReelingAndRearm();
       Serial.println("Reeling done. Final distance stored/sent.");
     } else {
       Serial.println("DONE ignored: not currently reeling.");
-    }
-  } else if (ch == '?') {
-    Serial.print("dyn=");
-    Serial.print(imuDynAccel, 3);
-    Serial.print(" force=");
-    Serial.print(forceNewtons, 3);
-    Serial.print(" hold=");
-    Serial.print(forceHold, 3);
-    Serial.print(" state=");
-    Serial.print(stateLabel(state, millis() < biteBannerUntil));
-    Serial.print(" tempC=");
-    if (waterTempC == DEVICE_DISCONNECTED_C) {
-      Serial.println("NA");
-    } else {
-      Serial.println(waterTempC, 2);
     }
   }
 }
